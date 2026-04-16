@@ -1,7 +1,8 @@
 import torch
 import triton
 
-from liger_kernel.ops.backends._ascend.ops.cross_entropy import liger_cross_entropy_kernel
+from liger_kernel.ops.backends._ascend.ops.cross_entropy import liger_cross_entropy_backward_kernel
+from liger_kernel.ops.backends._ascend.ops.cross_entropy import liger_cross_entropy_forward_kernel
 from liger_kernel.ops.backends._ascend.ub_manager import compute_default_tiling_strategy
 from liger_kernel.ops.utils import amp_custom_bwd
 from liger_kernel.ops.utils import amp_custom_fwd
@@ -69,7 +70,8 @@ def fused_linear_cross_entropy_forward(
     input_requires_grad = _input.requires_grad
     BT, H = _input.shape
     V = weight.shape[0]
-    BLOCK_SIZE = get_optimal_block_size(V, has_gradients=_input.requires_grad)
+    forward_block_size = get_optimal_block_size(V, has_gradients=False)
+    backward_block_size = get_optimal_block_size(V, has_gradients=True) if input_requires_grad else forward_block_size
 
     inc_factor = triton.cdiv(V, H)  # (V + H - 1) // H
     chunk_size = triton.next_power_of_2(triton.cdiv(BT, inc_factor))  # (BT + inc_factor - 1) // inc_factor
@@ -129,7 +131,7 @@ def fused_linear_cross_entropy_forward(
         # Compute predicted probabilities for token scaling if needed
         if use_token_scaling:
             # Compute softmax probabilities for scaling
-            # We need to compute this before the cross entropy kernel modifies logits_chunk
+            # We compute token scaling from the forward logits before any gradient kernel runs.
             logits_for_softmax = logits_chunk.detach().clone()  # Detach to avoid gradient flow
             if softcap is not None:
                 logits_for_softmax = softcap * torch.tanh(logits_for_softmax / softcap)
@@ -159,6 +161,7 @@ def fused_linear_cross_entropy_forward(
         # unreduced loss
         loss_1d_slice = loss_1d[start_idx:end_idx]  # chunk_size,
         z_loss_1d_slice = z_loss_1d[start_idx:end_idx] if return_z_loss else None
+        lse_1d_slice = torch.empty(n_rows, dtype=torch.float32, device=device) if input_requires_grad else loss_1d_slice
         token_accuracy_1d_slice = token_accuracy_1d[start_idx:end_idx] if return_token_accuracy else None
         predicted_tokens_1d_slice = predicted_tokens_1d[start_idx:end_idx] if return_predicted_tokens else None
 
@@ -166,7 +169,7 @@ def fused_linear_cross_entropy_forward(
         logits_chunk = logits_chunk.contiguous()
         target_chunk = target_chunk.contiguous()
 
-        liger_cross_entropy_kernel[(min(n_rows, num_cores),)](
+        liger_cross_entropy_forward_kernel[(min(n_rows, num_cores),)](
             X_ptr=logits_chunk,
             X_stride=logits_chunk.stride(-2),
             Y_ptr=target_chunk,
@@ -174,7 +177,9 @@ def fused_linear_cross_entropy_forward(
             weight_ptr=ce_weight,
             loss_ptr=loss_1d_slice,
             z_loss_ptr=z_loss_1d_slice,
+            lse_ptr=lse_1d_slice,
             loss_stride=loss_1d_slice.stride(-1),  # always 1
+            lse_stride=lse_1d_slice.stride(-1),  # always 1
             token_accuracy_ptr=token_accuracy_1d_slice,
             token_accuracy_stride=token_accuracy_1d_slice.stride(-1)
             if return_token_accuracy
@@ -194,12 +199,12 @@ def fused_linear_cross_entropy_forward(
             reduction=reduction,
             softcap=softcap,
             RETURN_Z_LOSS=return_z_loss,
+            SAVE_LSE=input_requires_grad,
             RETURN_TOKEN_ACCURACY=return_token_accuracy,
             RETURN_PREDICTED_TOKENS=return_predicted_tokens,
             HAS_WEIGHT=True if ce_weight is not None else False,
             HAS_SOFTCAPPING=True if softcap is not None else False,
-            HAS_GRADIENTS=input_requires_grad,
-            BLOCK_SIZE=BLOCK_SIZE,
+            BLOCK_SIZE=forward_block_size,
         )
 
         # Apply token scaling if requested
@@ -215,18 +220,38 @@ def fused_linear_cross_entropy_forward(
             token_accuracy_1d[start_idx:end_idx] = token_accuracy_1d_slice
         if return_predicted_tokens:
             predicted_tokens_1d[start_idx:end_idx] = predicted_tokens_1d_slice
-        grad_logits_chunk = logits_chunk  # chunk_size x V
-
-        # Apply token scaling to gradients if requested
-        if use_token_scaling:
-            # Expand scaling factors to match gradient dimensions
-            scaling_factors_expanded = scaling_factors.unsqueeze(-1)  # chunk_size x 1
-            grad_logits_chunk = grad_logits_chunk * scaling_factors_expanded
-
         if input_requires_grad:
-            grad_input[start_idx:end_idx] = grad_logits_chunk @ weight
+            grad_logits_chunk = torch.empty_like(logits_chunk)
+            liger_cross_entropy_backward_kernel[(min(n_rows, num_cores),)](
+                X_ptr=logits_chunk,
+                X_stride=logits_chunk.stride(-2),
+                Y_ptr=target_chunk,
+                Y_stride=target_chunk.stride(-1),
+                weight_ptr=ce_weight,
+                lse_ptr=lse_1d_slice,
+                lse_stride=lse_1d_slice.stride(-1),
+                dX_ptr=grad_logits_chunk,
+                dX_stride=grad_logits_chunk.stride(-2),
+                n_cols=V,
+                n_rows=n_rows,
+                n_non_ignore=total_n_non_ignore,
+                sum_non_ignore_weight=total_sum_non_ignore_ce_weight,
+                weight_sum=ce_weight_sum,
+                ignore_index=ignore_index,
+                lse_square_scale=lse_square_scale,
+                label_smoothing=label_smoothing,
+                reduction=reduction,
+                softcap=softcap,
+                BLOCK_SIZE=backward_block_size,
+                HAS_WEIGHT=True if ce_weight is not None else False,
+                HAS_SOFTCAPPING=True if softcap is not None else False,
+            )
 
-        if bias is not None:
+            if use_token_scaling:
+                scaling_factors_expanded = scaling_factors.unsqueeze(-1)
+                grad_logits_chunk = grad_logits_chunk * scaling_factors_expanded
+
+            grad_input[start_idx:end_idx] = grad_logits_chunk @ weight
             logits[start_idx:end_idx] = grad_logits_chunk
 
     if grad_weight is not None and input_requires_grad:
