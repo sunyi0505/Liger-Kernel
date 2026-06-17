@@ -59,6 +59,9 @@ from liger_kernel.ops.backends._ascend.ops.layer_norm import layer_norm_forward
 from liger_kernel.ops.backends._ascend.ops.llama4_rope import LigerLlama4RopeFunction
 from liger_kernel.ops.backends._ascend.ops.llama4_rope import llama4_rope_backward
 from liger_kernel.ops.backends._ascend.ops.llama4_rope import llama4_rope_forward
+from liger_kernel.ops.backends._ascend.ops.modulated_rms_norm import LigerModulatedRMSNormFunction
+from liger_kernel.ops.backends._ascend.ops.modulated_rms_norm import modulated_rms_norm_backward
+from liger_kernel.ops.backends._ascend.ops.modulated_rms_norm import modulated_rms_norm_forward
 from liger_kernel.ops.backends._ascend.ops.mhc import LigerMHCCoeffsFunction
 from liger_kernel.ops.backends._ascend.ops.mhc import LigerMHCPostResFunction
 from liger_kernel.ops.backends._ascend.ops.mhc import LigerMHCPreFunction
@@ -103,6 +106,9 @@ __all__ = [
     "LigerRMSNormFunction",
     "rms_norm_forward",
     "rms_norm_backward",
+    "LigerModulatedRMSNormFunction",
+    "modulated_rms_norm_forward",
+    "modulated_rms_norm_backward",
     "LigerRopeFunction",
     "rope_forward",
     "rope_backward",

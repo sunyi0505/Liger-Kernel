@@ -135,7 +135,6 @@ def _make_modulation(shape, hd, scale_mode, dtype):
 @pytest.mark.parametrize("scale_mode", ["global", "batch", "row"])
 @pytest.mark.parametrize("has_shift", [True, False])
 @pytest.mark.parametrize("elementwise_affine", [True, False])
-@pytest.mark.skipif(device == "npu", reason="Ascend NPU does not support this test")
 def test_correctness(bs, sl, hd, dtype, atol, rtol, offset, casting_mode, scale_mode, has_shift, elementwise_affine):
     if dtype == torch.bfloat16 and casting_mode == "none":
         atol = 2e-1
